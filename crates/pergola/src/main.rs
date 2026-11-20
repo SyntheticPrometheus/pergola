@@ -25,29 +25,22 @@ fn main() -> ExitCode {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args = std::env::args().skip(1);
     let mut socket = config::socket_path();
-    let mut rest: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--socket" => {
-                if let Some(path) = args.get(i + 1) {
-                    socket = PathBuf::from(path);
-                    i += 2;
-                } else {
-                    eprintln!("pergola: --socket needs a path");
-                    return ExitCode::FAILURE;
-                }
-            }
-            other => {
-                rest.push(other.to_string());
-                i += 1;
-            }
+    let mut rest = Vec::new();
+    while let Some(arg) = args.next() {
+        if arg == "--socket" {
+            let Some(path) = args.next() else {
+                eprintln!("pergola: --socket needs a path");
+                return ExitCode::FAILURE;
+            };
+            socket = PathBuf::from(path);
+        } else {
+            rest.push(arg);
         }
     }
 
-    let Some(command) = rest.first().cloned() else {
+    let Some(command) = rest.first() else {
         print_help();
         return ExitCode::SUCCESS;
     };

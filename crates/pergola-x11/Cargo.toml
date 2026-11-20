@@ -11,4 +11,3 @@ repository.workspace = true
 pergola-core.workspace = true
 x11rb.workspace = true
 anyhow.workspace = true
-thiserror.workspace = true
