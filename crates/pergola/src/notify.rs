@@ -35,10 +35,29 @@ fn invocation(override_command: Option<&str>, message: &str) -> Option<(String, 
 
 /// Show `message` as a desktop notification. Never blocks, never fails loudly.
 pub fn send(message: &str) {
+    send_with_timeout(message, None, false);
+}
+
+pub fn workspace(message: &str, recovery_hint: Option<&str>) {
+    send_with_timeout(message, recovery_hint, recovery_hint.is_none());
+}
+
+fn send_with_timeout(message: &str, default_hint: Option<&str>, brief: bool) {
     let override_command = std::env::var("PERGOLA_NOTIFY").ok();
-    let Some((program, args)) = invocation(override_command.as_deref(), message) else {
+    let custom_command = override_command
+        .as_deref()
+        .filter(|cmd| !cmd.trim().is_empty());
+    let body = if custom_command.is_some() {
+        message
+    } else {
+        default_hint.unwrap_or(message)
+    };
+    let Some((program, mut args)) = invocation(custom_command, body) else {
         return;
     };
+    if brief && custom_command.is_none() {
+        args.insert(0, "--expire-time=1000".into());
+    }
     // Detached and silent: the notifier's own output is not ours to show, and a
     // CLI that exits before it finishes must not wait for it.
     let Ok(mut child) = Command::new(program)
