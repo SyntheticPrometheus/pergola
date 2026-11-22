@@ -348,6 +348,50 @@ MINOR bump; it now reads `Cargo.toml`.
 tags only stable releases, so the first tag is the 1.0.0 gate — no earlier tag can honestly
 produce a release.
 
+### 1.0.0 gate: measured on HEAD 3f56532 (2026-11-20) — not met
+
+The gate text is `docs/VERSIONING.md` § "The 1.0.0 gate". HEAD moved from the
+recorded `a3d5bce` to `3f56532` (2026-11-20 14:23 -0500, "fix(health): drift is
+not computed for a window on another desktop"); branch `main`, working tree
+clean. Measurements below are from that commit.
+
+1. **Scope complete — FAIL.** `scripts/e2e.sh` (xfwm4) is 219 passed, 0 failed.
+   `scripts/e2e.sh --wm openbox` is 217 passed, 2 failed, exit 1. The two
+   failures are commands in the README: "holding a chord goes back once, not
+   eleven times: expected [p-80000c] got [p-40000c]" (camera `back`) and "undo
+   restored a third tree" (`undo`). Repro: `scripts/e2e.sh --wm openbox`.
+   So not every command works on the second WM.
+2. **No known reproducible bugs — FAIL on the heading, PASS on the literal test.**
+   GitHub has 0 open issues (only PRs #3 and #4 are open; #1 and #2 are closed
+   PRs). But the openbox failure above is a known, reproducible bug: it is
+   agenda bug #349 ("pergola e2e is not green on openbox", open, p2), and
+   `docs/COMPATIBILITY.md` cites it as "bug #349" without saying it is an
+   agenda id, not a repo issue. A reader who checks GitHub finds no #349.
+3. **Frozen interfaces — PARTIAL.** CLI: `docs/COMMANDS.md` documents every
+   command. IPC: `docs/DESIGN.md` documents the socket request/response shape
+   (lines 121, 226). layout.json: `version: 2` is named in `docs/VERSIONING.md`
+   and `crates/pergola-core/src/document.rs` points at `docs/RESEARCH.md`, but
+   RESEARCH.md documents TrellisWM's grammar and `capture/layout-schema.json`
+   does not exist in this repo; the v2 document grammar is not written down in
+   Pergola's own docs. The "loads in every later 1.x" promise is additive
+   loading (`docs/SETUP.md`), not yet tested across a 1.x line.
+4. **Green gates — PASS for the default run.** `cargo test`: 138 tests, 0 failed
+   (77 + 53 + 8 + 0 + 0), exit 0. `scripts/e2e.sh` (xfwm4): 219 passed, 0
+   failed, exit 0. Working tree clean. The openbox variant is condition 1's
+   failure, not a separate default-run failure.
+5. **Documented limitations accurate — FAIL.** `README.md` "Known limitations"
+   says "Verified inside xfwm4 (XFCE) and Openbox", but openbox has 2 failing
+   assertions. `docs/COMPATIBILITY.md` does disclose "not green", but the README
+   bullet reads as a clean verification and does not point at the failing
+   assertions. That is the silent gap the condition forbids. The compat doc's
+   count is also stale: it says 221 assertions and 3 failures; this run measured
+   219 assertions and 2 failures.
+
+**Verdict: the gate is not met; no tag.** Blocking condition: 1 (openbox
+`back`/`undo`). Condition 2 is open as agenda bug #349; conditions 3 and 5 need
+doc fixes (layout.json v2 grammar; README's Openbox claim). Condition 4's
+default runs are green. Health: `pergola-health` exits 0.
+
 ## Not planned
 
 - **Wayland-native.** An external process cannot move Wayland clients; anything here would be a
