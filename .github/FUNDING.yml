@@ -1,0 +1,4 @@
+# Publishable funding rails for Pergola. GitHub Sponsors is not enrolled, so the
+# custom link points at the in-repo page that names the address; see
+# docs/FUNDING.md. Keep this file and that page in the same commit.
+custom: ["https://github.com/SyntheticPrometheus/pergola/blob/main/docs/FUNDING.md"]

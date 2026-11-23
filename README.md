@@ -480,6 +480,12 @@ just the daemon's own bookkeeping.
 Versioning: [docs/VERSIONING.md](docs/VERSIONING.md). Current version is
 `0.5.0-dev` — pre-stable, no compatibility promises.
 
+## Support
+
+Pergola is MIT-licensed, has no paid tier and no feature behind a payment. If it
+saves you time, **[docs/FUNDING.md](docs/FUNDING.md)** names a USDC/Base address;
+GitHub's Sponsor button points at the same page. Nothing is gated on it.
+
 ## License
 
 MIT © SyntheticPrometheus. "TrellisWM" is a trademark of its owner and is used
