@@ -400,7 +400,12 @@ before Pergola and maps every failure class to the fix that answers it.
 
 * **X11 only.** No Wayland-native support; XWayland clients only.
 * Verified inside **xfwm4** (XFCE) and **Openbox**, live and in isolation; any
-  EWMH window manager should work, but only those two have been measured.
+  EWMH window manager should work, but only those two have been measured. Both
+  are green in `scripts/e2e.sh`: xfwm4 219/219, Openbox 215–217 assertions in 7
+  consecutive runs (2026-11-24) — the counts differ because Openbox skips the drop-frame
+  assertions and its tree holds a different number of tiles, and the Openbox
+  suite is repeated (`scripts/e2e-soak.sh`) because a run of it has failed in
+  ways that moved from run to run.
 * Windows outside the framed view are moved off-screen. Some WMs (xfwm4) clamp
   them to keep a sliver reachable, so a docked tile can peek at the screen edge.
 * Windows that set size hints (terminals with a character grid) are fitted to
@@ -462,6 +467,7 @@ before Pergola and maps every failure class to the fix that answers it.
 cargo test               # unit tests: geometry, tree, camera, commands, document, tags, settings, palette, event diff
 scripts/e2e.sh           # assertions against Xvfb + a real WM + real xterms
 scripts/e2e.sh --wm openbox   # the same suite under a second WM
+scripts/e2e-soak.sh --wm openbox --runs 3   # and again: a per-WM green run is only trusted when it repeats
 scripts/health.sh        # soak check of a running daemon (cpu, layout, drift, orphans)
 scripts/health.sh --e2e  # the above plus the regression suite (xfwm4)
 scripts/health.sh --e2e --wm openbox   # ... under a second WM; the line names it

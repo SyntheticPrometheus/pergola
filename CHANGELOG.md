@@ -46,6 +46,25 @@ All notable changes to Pergola. Format follows the versioning rules in
 
 ### Fixed
 
+* **The e2e suite is green under Openbox, and stays green when repeated.** The
+  failures that moved between runs (`back` going back twice, `undo` restoring a
+  third tree, `tag-windows`, `ratio-nudge`, an activation request) were one bug:
+  every `ConfigureNotify` the daemon could not recognise as its own apply started
+  a movement watch, and a watch that saw 44 px of travel re-docked the tile. It
+  could not recognise two Openbox habits. Openbox reports the client at exactly
+  the position asked for, so the frame rect computed from the report is 1 px left
+  and 1 px up of the rect we recorded — at a 0.5 px comparison every apply grew a
+  phantom watch (`DECORATION_SLOP_PX`, 2 px). And Openbox pulls a parked window
+  back so 44 px stay reachable, which is 44 px of travel away from the rect we
+  parked it at — a configure for a window our own last apply placed outside the
+  work area is now the WM's placement, not a gesture (`parked_off_screen`, tested
+  against the work area the rects were computed in, so a zero-sized screen parks
+  nothing). Unit tests pin both, and `scripts/e2e-soak.sh` runs the suite N times
+  so "green" means repeated, not lucky: measured 2026-11-24, 7 consecutive
+  openbox runs (one direct run, three in parallel on their own displays, then
+  `scripts/e2e-soak.sh --wm openbox --runs 3`), 0 failed (215–217 assertions)
+  and xfwm4 219/219.
+
 * **First-run docking and terminal splitting keep their target.** Focusing a new
   floating window no longer replaces the last tiled target. `split-terminal`
   remembers the source before the new terminal takes focus and works from a

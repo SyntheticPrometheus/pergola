@@ -350,6 +350,18 @@ produce a release.
 
 ### 1.0.0 gate: measured on HEAD 3f56532 (2026-11-20) — not met
 
+**Re-measured 2026-11-24 (61c6a54 + the Openbox configure fix).** Conditions 1
+and 2 are now met: `scripts/e2e.sh --wm openbox` is 0 failed in 7 consecutive
+runs (215–217 assertions; the count moves with the tree), `scripts/e2e.sh`
+(xfwm4) is 219 passed 0 failed, and `cargo test` is 140 passed 0 failed
+(79 + 53 + 8). The moving failures were one bug — a `ConfigureNotify` the
+daemon did not recognise as its own apply started a phantom movement watch,
+and 44 px of Openbox's parked-window clamp read as a drag that re-docked the
+tile. Agenda bug #349 is closed. Because the failures used to migrate between
+runs, the gate now asks for repetition: `scripts/e2e-soak.sh --wm openbox
+--runs 3` (`docs/VERSIONING.md` condition 4). Conditions 3 and 5 below still
+stand as written.
+
 The gate text is `docs/VERSIONING.md` § "The 1.0.0 gate". HEAD moved from the
 recorded `a3d5bce` to `3f56532` (2026-11-20 14:23 -0500, "fix(health): drift is
 not computed for a window on another desktop"); branch `main`, working tree

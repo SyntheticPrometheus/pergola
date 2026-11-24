@@ -195,7 +195,7 @@ fn deferred_action(
     stable: Option<Instant>,
     now: Instant,
 ) -> DeferredAction {
-    if applied.is_some_and(|a| same_rect(a, live)) {
+    if applied.is_some_and(|a| same_rect_within(a, live, DECORATION_SLOP_PX)) {
         return DeferredAction::Discard;
     }
     if !same_rect(live, remembered) {
@@ -247,6 +247,10 @@ pub struct Daemon {
     deferred: HashMap<u32, DeferredConfigure>,
     /// When our own apply last ran; edge detection ignores its event wake.
     last_apply: Instant,
+    /// The work area of the last apply, the frame the `applied` rects were
+    /// computed in. A configure for a window we placed outside it is the WM
+    /// clamping a parked window back into view, not a gesture.
+    last_screen: Option<IRect>,
     /// The last `KeyRelease` seen: keycode and server timestamp. The server
     /// auto-repeats a held key by sending a `KeyRelease` and a `KeyPress` with
     /// the *same* timestamp, so that pair is a repeat and the press is dropped.
@@ -322,6 +326,7 @@ impl Daemon {
             moves: HashMap::new(),
             deferred: HashMap::new(),
             last_apply: Instant::now(),
+            last_screen: None,
             last_release: None,
             started: false,
             undo: History::new(UNDO_DEPTH),
@@ -505,6 +510,11 @@ impl Daemon {
     /// [`on_another_desktop`] for why it is left alone there.
     fn foreign_desktop(&self, window: u32) -> bool {
         on_another_desktop(self.x.current_desktop(), self.x.desktop_of(window))
+    }
+
+    /// The frame the `applied` rects were computed in (see `last_screen`).
+    fn last_screen(&self) -> Option<Rect> {
+        self.last_screen.map(|r| r.to_rect())
     }
 
     fn focused_panel(&self) -> Option<String> {
@@ -701,6 +711,7 @@ impl Daemon {
         if screen.w <= 0 || screen.h <= 0 {
             return Ok(());
         }
+        self.last_screen = Some(screen);
         let world = screen.to_rect();
         // The camera must point at a node that exists in the tree being drawn.
         // A command may move the last window off a tag, leaving the camera
@@ -2940,7 +2951,23 @@ impl Daemon {
     /// The rect is what the window reported (or, for a deferred event, what the
     /// server says it is now), so an echo of our own apply is still skipped.
     fn track_configure(&mut self, window: u32, rect: Rect) -> Result<()> {
-        if let Some(applied) = self.applied.get(&window) {
+        let applied = self.applied.get(&window).map(|r| r.to_rect());
+        if let Some(applied) = applied {
+            // A window we parked off the work area is not being dragged: its
+            // title bar is not on screen to grab. Some WMs (openbox) pull such
+            // a window back so a sliver stays reachable, which reports a rect
+            // 44 px from the one we asked for — far enough to read as a drag,
+            // after which the parked tile re-docks itself into the tree. That
+            // is the churn behind the openbox e2e's varying failures (measured
+            // 2026-11-23: 'holding a chord goes back once' and 'undo restored a
+            // third tree' both came from a parked tile re-docking during an
+            // unrelated step). The clamp is the WM's placement, not a gesture.
+            if self
+                .last_screen()
+                .is_some_and(|screen| parked_off_screen(applied, screen))
+            {
+                return Ok(());
+            }
             // An echo of our own apply reports the rect we asked for. A drag
             // already in progress is different: the WM is reporting real
             // motion, and a drop that lands exactly on the rect we last placed
@@ -2952,7 +2979,7 @@ impl Daemon {
             // 'no drop target during a drag': the reported rect was 83 px from
             // the right edge because only the intermediate events counted).
             let drag_in_progress = self.moves.get(&window).is_some_and(is_drag);
-            if same_rect(applied.to_rect(), rect) && !drag_in_progress {
+            if same_rect_within(applied, rect, DECORATION_SLOP_PX) && !drag_in_progress {
                 return Ok(());
             }
         }
@@ -2963,8 +2990,9 @@ impl Daemon {
         // clamped, or our own echo, does not move. Measured 2026-11-15: with a
         // strict "three configure events" rule, edge docking never fired under
         // openbox and the e2e suite's one failing assertion was this path.
-        let baseline = self.applied.get(&window).map(|r| r.to_rect());
-        let moved_from_baseline = baseline.is_some_and(|b| !same_rect(b, rect));
+        let baseline = applied;
+        let moved_from_baseline =
+            baseline.is_some_and(|b| !same_rect_within(b, rect, DECORATION_SLOP_PX));
         let watch = self.moves.entry(window).or_insert(MoveWatch {
             moves: u32::from(moved_from_baseline),
             at: Instant::now(),
@@ -3372,6 +3400,16 @@ fn pointer_edge(x: f64, y: f64, screen: Rect, slack: f64) -> Option<Direction> {
 /// How long after our own apply a ConfigureNotify is treated as its echo.
 const APPLY_GUARD: Duration = Duration::from_millis(100);
 
+/// How far an echo of our own apply may differ from the rect we asked for and
+/// still be recognised as ours. A window manager adds the decoration back to
+/// the client rect it reports, and the two do not have to agree with ours about
+/// which rect the request named: openbox reports the client at exactly the
+/// position the daemon asked for, so the frame rect we compute from it is one
+/// pixel left and one pixel up from the rect we recorded (measured 2026-11-23).
+/// At 0.5 px that echo read as somebody else's move, and every apply grew a
+/// phantom movement watch.
+const DECORATION_SLOP_PX: f64 = 2.0;
+
 /// How long a deferred event's live rect must stand still before it is judged.
 const DEFERRED_STABLE: Duration = Duration::from_millis(80);
 
@@ -3670,10 +3708,37 @@ fn on_another_desktop(current: Option<u32>, window: Option<u32>) -> bool {
 }
 
 fn same_rect(a: Rect, b: Rect) -> bool {
-    (a.x - b.x).abs() < 0.5
-        && (a.y - b.y).abs() < 0.5
-        && (a.w - b.w).abs() < 0.5
-        && (a.h - b.h).abs() < 0.5
+    same_rect_within(a, b, 0.5)
+}
+
+/// The same comparison with a stated tolerance, for the places where a window
+/// manager's decoration rounding is expected (see `DECORATION_SLOP_PX`) and an
+/// exact comparison would call our own placement somebody else's move.
+fn same_rect_within(a: Rect, b: Rect, slop: f64) -> bool {
+    (a.x - b.x).abs() <= slop
+        && (a.y - b.y).abs() <= slop
+        && (a.w - b.w).abs() <= slop
+        && (a.h - b.h).abs() <= slop
+}
+
+/// Whether two rectangles share any area. A rect with a zero side (a collapsed
+/// desktop leaf) shares nothing.
+fn overlaps(a: Rect, b: Rect) -> bool {
+    a.w > 0.0
+        && a.h > 0.0
+        && b.w > 0.0
+        && b.h > 0.0
+        && a.x < b.max_x()
+        && a.max_x() > b.x
+        && a.y < b.max_y()
+        && a.max_y() > b.y
+}
+
+/// True when the rect we last *placed* a window at has left the work area — the
+/// daemon parks a window below the screen to take it off screen, so a configure
+/// for such a window is the window manager's placement, never a drag.
+fn parked_off_screen(applied: Rect, screen: Rect) -> bool {
+    !overlaps(applied, screen)
 }
 
 /// Map a world rect (0..screen) into the rectangle the desktop leaf occupies.
@@ -4137,6 +4202,44 @@ mod tests {
             deferred_action(Some(applied), remembered, applied, None, now),
             DeferredAction::Discard
         );
+    }
+
+    #[test]
+    fn a_decoration_rounding_echo_is_still_our_own_apply() {
+        // openbox reports the client at exactly the position we asked for, so
+        // the frame rect computed from the report is 1 px left and 1 px up of
+        // the one we recorded. That is our echo, not a drag: at a 0.5 px
+        // tolerance every apply grew a phantom watch and the parked tile
+        // re-docked into the tree (measured 2026-11-23, openbox e2e).
+        let applied = Rect::new(803.0, 0.0, 792.0, 889.0);
+        let reported = Rect::new(802.0, -1.0, 792.0, 889.0);
+        assert!(!same_rect(applied, reported), "an exact compare says different");
+        assert!(same_rect_within(applied, reported, DECORATION_SLOP_PX));
+        let now = Instant::now();
+        assert_eq!(
+            deferred_action(Some(applied), reported, reported, None, now),
+            DeferredAction::Discard
+        );
+        // A real move is still a move.
+        assert!(!same_rect_within(applied, Rect::new(500.0, 0.0, 792.0, 889.0), DECORATION_SLOP_PX));
+    }
+
+    #[test]
+    fn a_window_we_parked_off_screen_is_never_a_drag() {
+        // The daemon parks a window below the work area; openbox pulls it back
+        // so 44 px stay reachable, which is 44 px of travel — enough to read as
+        // a drag and re-dock the parked tile.
+        let screen = Rect::new(0.0, 0.0, 1600.0, 900.0);
+        let parked = Rect::new(0.0, 900.0, 1596.0, 447.0);
+        let clamped = Rect::new(0.0, 856.0, 1596.0, 447.0);
+        assert!(parked_off_screen(parked, screen));
+        assert!(!parked_off_screen(clamped, screen), "a clamped window is on screen");
+        assert!(!parked_off_screen(Rect::new(0.0, 0.0, 792.0, 889.0), screen));
+        // A zero-sized screen (no output geometry yet) parks nothing: without a
+        // work area every rect "misses" it, and every configure would be
+        // swallowed.
+        assert!(overlaps(Rect::new(0.0, 0.0, 10.0, 10.0), screen));
+        assert!(!overlaps(screen, Rect::new(0.0, 0.0, 0.0, 900.0)));
     }
 
     #[test]

@@ -40,7 +40,11 @@ the following hold:
    and `layout.json` (`version: 2`) are documented and stable; a document written
    by `1.0.0` loads in every later `1.x`.
 4. **Green gates**: `cargo test` and `scripts/e2e.sh` pass with zero failures on
-   the release commit, from a clean checkout.
+   the release commit, from a clean checkout — and the second-WM run is
+   repeated: `scripts/e2e-soak.sh --wm openbox --runs 3` exits 0. One green
+   second-WM run is not evidence, because the failures this suite has had under
+   Openbox moved between runs and assertions (2026-11-20: `back`, `undo`,
+   `tag-windows` in one run, `ratio`, `back`, activation in the next).
 5. **Documented limitations** in `README.md` are accurate (no silent gaps).
 
 Until then the project stays `0.x.y-dev`.

@@ -269,12 +269,13 @@ is dropped (i3's `kill_timeout`), so a hung bar cannot pin memory either.
   hatch, a restart and a `tag` record), settings help and a rejected value's
   notification, a ratio nudge chord, the workspace chords, a window on another
   host desktop left where the WM put it, and a failed hotkey's notification —
-  219 assertions on xfwm4 (green) and 221 on openbox (218 pass, 3 fail — bug
-  #349; the two extra are the drop-frame assertions xfwm4 makes here). Openbox runs
-  the same suite and skips the drop-frame assertions because
-  it coalesces a drag into one `ConfigureNotify` (a WM capability, not a
-  tolerance), and its tree can hold one more tile, so the geometry count is not
-  identical. The event-stream block
+  219 assertions on xfwm4 (green) and 215–217 on openbox (green in 7 consecutive
+  runs, 2026-11-24; `scripts/e2e-soak.sh --wm openbox` is the repetition the
+  1.0.0 gate asks for, because the count moves with the tree rather than being a
+  constant). Openbox runs the same suite and skips the drop-frame assertions
+  because it coalesces a drag into one `ConfigureNotify` (a WM capability, not a
+  tolerance), and its tree can hold a different number of tiles, so the geometry
+  count is not identical. The event-stream block
   proves the state-first record, dock/undock/close records naming the window,
   valid JSON on every line, that a subscriber whose output goes to an undrained
   fifo does not delay `pergola status` (measured 47 ms at load 5.6), and that a
