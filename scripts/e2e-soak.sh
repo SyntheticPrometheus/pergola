@@ -5,6 +5,9 @@
 #   scripts/e2e-soak.sh --wm openbox          the second-WM gate
 #   scripts/e2e-soak.sh --wm=openbox --runs 5
 #
+# A stale binary (built from an older commit than HEAD) is checked first, via
+# scripts/health-selftest.sh: the tree must be rebuilt, not refused.
+#
 # Why repetition is the gate rather than a nice-to-have: the openbox failures
 # this suite once had moved between runs and moved between assertions
 # (2026-11-20: {hold-chord, undo-third-tree, tag-windows} in one run,
@@ -37,6 +40,18 @@ case "$RUNS" in ''|*[!0-9]*) echo "e2e-soak: --runs needs a positive integer" >&
 TMP="$(mktemp -d /tmp/pergola-soak.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
 FAILED=0
+
+# The stale-binary branch runs first, every soak. On 2026-11-25 the weekly
+# pergola-e2e-openbox row refused to judge a binary older than HEAD, exited 1 and
+# filed a priority-1 task (task #498); health-selftest.sh pins that a stale tree
+# is rebuilt instead, in ~10 s and with no display. Pinned but unwired is the
+# same as unwritten, so the soak is where it runs.
+if ! "$ROOT/scripts/health-selftest.sh" >"$TMP/selftest.log" 2>&1; then
+  echo "e2e-soak: health-selftest FAILED (a stale binary must be rebuilt, not filed)"
+  grep -E '^(FAIL|health-selftest:)' "$TMP/selftest.log" | sed 's/^/    /'
+  exit 1
+fi
+printf 'soak preflight  %s\n' "$(grep -E '^health-selftest: ' "$TMP/selftest.log" | tail -1)"
 
 for i in $(seq 1 "$RUNS"); do
   # A display is free when Xvfb left no socket for it; the suite refuses a
