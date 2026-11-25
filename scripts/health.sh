@@ -5,6 +5,11 @@
 #   scripts/health.sh --e2e        also run the full regression suite (~3 min)
 #   scripts/health.sh --e2e --wm openbox   run that suite under a second WM
 #   scripts/health.sh --quiet      print nothing when healthy (exit code still tells)
+#
+# With --e2e the suite must judge the tree's HEAD: if the binary under test was
+# built from another commit it is rebuilt first (cargo build --release, logged to
+# /tmp/pergola-health-build.log). PERGOLA_NO_BUILD=1 or an explicit PERGOLA_BIN
+# turns that off, so a release artifact can be measured without being rebuilt.
 #   scripts/health.sh --json       one machine-readable line on stdout
 #
 # Checks, in order: daemon answers, CPU under load, layout invariants, geometry
@@ -289,12 +294,34 @@ if [ "$E2E" -eq 1 ]; then
   HEAD="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   # Provenance: the binary's build commit must be the tree's HEAD, or the suite
   # is judging a different tree than it names. Say which binary and commit ran.
-  BIN_STAMP="$("$BIN" --version 2>/dev/null | sed -n 's/.*(\([^)]*\)).*/\1/p')"
+  stamp_of() { "$1" --version 2>/dev/null | sed -n 's/.*(\([^)]*\)).*/\1/p'; }
+  BIN_STAMP="$(stamp_of "$BIN")"
   STALE=""
   if [ -z "$BIN_STAMP" ]; then
     STALE="$BIN carries no build commit"
   elif [ "$HEAD" != "unknown" ] && [ "$BIN_STAMP" != "$HEAD" ]; then
     STALE="$BIN is commit $BIN_STAMP, tree is $HEAD"
+  fi
+  # A stale binary is this script's problem, not the owner's memory. The check
+  # refuses to judge the wrong tree (2026-11-17); refusing is still a failure, so
+  # the weekly row filed a priority-1 task for a tree nobody had built after the
+  # last commit (task #497, 2026-11-25). Build the tree under test instead. Not
+  # when the caller named a binary or opted out: those say what is measured.
+  if [ -n "$STALE" ] && [ -z "${PERGOLA_BIN:-}" ] && [ "${PERGOLA_NO_BUILD:-}" != "1" ] \
+     && [ -f "$ROOT/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+    note "  ..   $STALE — building the tree under test"
+    if ( cd "$ROOT" && timeout 900 cargo build --release ) >/tmp/pergola-health-build.log 2>&1; then
+      BIN="$ROOT/target/release/pergola"
+      BIN_STAMP="$(stamp_of "$BIN")"
+      if [ "$BIN_STAMP" = "$HEAD" ]; then
+        STALE=""
+        note "  ok   built $BIN at $BIN_STAMP"
+      else
+        STALE="$BIN still carries $(stamp_of "$BIN" || echo no) commit after a build, tree is $HEAD"
+      fi
+    else
+      STALE="$STALE — cargo build --release failed (see /tmp/pergola-health-build.log)"
+    fi
   fi
   if [ ! -x "$ROOT/scripts/e2e.sh" ]; then
     fail "e2e suite not found (set PERGOLA_REPO to the checkout)"

@@ -46,6 +46,21 @@ All notable changes to Pergola. Format follows the versioning rules in
 
 ### Fixed
 
+* **`scripts/health.sh --e2e` builds the tree under test instead of failing on a
+  stale binary.** The provenance check added on 2026-11-17 refuses to judge a
+  tree the binary on disk was not built from, which is right — but the refusal
+  itself exits 1, so the weekly `pergola-e2e-openbox` row filed a priority-1
+  task for a tree nobody had built after the last commit (task #497, 2026-11-25:
+  binary 61c6a54, tree bbc2f7d). A stale binary is now rebuilt first (`cargo
+  build --release`, logged to `/tmp/pergola-health-build.log`), so the row
+  measures HEAD instead of the gap between builds. An explicit `PERGOLA_BIN` or
+  `PERGOLA_NO_BUILD=1` keeps the refusal, so a release artifact is still
+  measured as published. `scripts/health-selftest.sh` pins all three branches on
+  a throw-away checkout in ~8 s, no display needed. Found on the way: the build
+  script watched `.git/HEAD`, which a commit on a branch never touches, so
+  `cargo build --release` could print "Finished" and leave the binary stamped
+  with the previous commit. It now watches `.git/refs` as well.
+
 * **The e2e suite is green under Openbox, and stays green when repeated.** The
   failures that moved between runs (`back` going back twice, `undo` restoring a
   third tree, `tag-windows`, `ratio-nudge`, an activation request) were one bug:

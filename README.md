@@ -471,6 +471,7 @@ scripts/e2e-soak.sh --wm openbox --runs 3   # and again: a per-WM green run is o
 scripts/health.sh        # soak check of a running daemon (cpu, layout, drift, orphans)
 scripts/health.sh --e2e  # the above plus the regression suite (xfwm4)
 scripts/health.sh --e2e --wm openbox   # ... under a second WM; the line names it
+scripts/health-selftest.sh   # a stale binary is rebuilt, not filed as a failure
 cargo build --release
 ```
 

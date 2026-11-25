@@ -381,7 +381,11 @@ a supervisor can restart it.
 drift against what the X server reports, docked windows that no longer exist,
 and (with `--e2e`) runs the full regression suite. `--e2e --wm openbox` runs
 that suite under a second window manager, and the summary line and the
-`health.jsonl` record both name the one that ran (`"wm":"openbox"`). `--json`
+`health.jsonl` record both name the one that ran (`"wm":"openbox"`). The suite
+judges the tree's HEAD, so a binary built from another commit is rebuilt first
+(`cargo build --release`, logged to `/tmp/pergola-health-build.log`);
+`PERGOLA_NO_BUILD=1` or an explicit `PERGOLA_BIN` turns that off, for measuring
+a release artifact as published. `--json`
 prints one line, `--quiet` prints nothing when healthy; both keep the exit code,
 so a timer can act on it. The suite uses fixed sleeps, so run it on an idle
 machine — under CPU saturation a few checks flake.
