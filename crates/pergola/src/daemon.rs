@@ -2,7 +2,8 @@
 //! applies geometry through the running desktop's window manager.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -26,6 +27,45 @@ use x11rb::protocol::Event;
 
 use crate::config::{self, Config};
 use crate::ipc::{Request, Response};
+
+/// Wait on the X connection and the IPC reader together. X11 may already have
+/// buffered an event while reading a synchronous reply, so check it first.
+fn wait_for_input(x: &X11, wake: &mut UnixStream, timeout: Duration) -> Result<Option<Event>> {
+    if let Some(event) = x.poll_event()? {
+        return Ok(Some(event));
+    }
+    let mut fds = [
+        libc::pollfd {
+            fd: x.conn.stream().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    // Both descriptors outlive the call and poll only writes to this array.
+    // Round up: truncating a sub-millisecond remainder would busy-poll
+    // until the reconciliation or focus deadline.
+    let timeout_ms = timeout.as_nanos().div_ceil(1_000_000) as i32;
+    let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout_ms) };
+    if ready < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(None);
+        }
+        return Err(err.into());
+    }
+    if fds[1].revents != 0 {
+        let mut signals = [0; 256];
+        if wake.read(&mut signals)? == 0 {
+            anyhow::bail!("IPC listener stopped");
+        }
+    }
+    x.poll_event()
+}
 
 static NEXT_LAYOUT_WRITE: AtomicU64 = AtomicU64::new(0);
 
@@ -219,6 +259,8 @@ pub struct Daemon {
     bindings: Vec<(KeyBinding, String)>,
     keymap: Vec<(u8, u32)>,
     seats: Vec<SeatRecord>,
+    /// Seated clients with a confirmed property/structure event subscription.
+    watched: HashSet<u32>,
     /// Last focused tiled panel. A newly focused floating window must not
     /// replace the docking target it will be placed beside.
     last_focus: Option<String>,
@@ -313,6 +355,7 @@ impl Daemon {
             bindings,
             keymap,
             seats,
+            watched: HashSet::new(),
             last_focus: None,
             last_desk: None,
             place_floating: true,
@@ -347,13 +390,13 @@ impl Daemon {
     /// Match the tree against the live client list: drop panels whose window is
     /// gone, adopt new windows, refresh titles.
     fn reconcile(&mut self) -> Result<bool> {
-        let windows = self.x.windows()?;
+        let windows = self.x.client_list()?;
         // `_NET_CLIENT_LIST` still contains a minimised window (and windows on
         // the host WM's other desktops) even though it is unmapped. A seat is
         // gone only when its window leaves the client list: dropping it because
         // the window was merely minimised collapses the tile and loses the
         // layout — i3#718, awesome#92.
-        let clients: HashSet<u32> = self.x.client_list()?.into_iter().collect();
+        let clients: HashSet<u32> = windows.iter().copied().collect();
 
         let gone: Vec<SeatRecord> = self
             .seats
@@ -363,6 +406,7 @@ impl Daemon {
             .collect();
         let mut changed = !gone.is_empty();
         for seat in gone {
+            self.watched.remove(&seat.window);
             self.applied.remove(&seat.window);
             self.moves.remove(&seat.window);
             self.deferred.remove(&seat.window);
@@ -377,14 +421,17 @@ impl Daemon {
             self.file.doc.floating.retain(|f| f.panel.id != seat.panel);
         }
 
-        for w in &windows {
+        for win in windows {
+            if self.watched.contains(&win) {
+                continue;
+            }
+            if self.seats.iter().any(|seat| seat.window == win) {
+                self.watch_seat(win);
+                continue;
+            }
+            let Ok(Some(info)) = self.x.info(win) else { continue };
+            let w = &info;
             if w.hidden {
-                // Minimised: keep the seat and its title, but do not treat the
-                // geometry as the user's.
-                if let Some(record) = self.seats.iter_mut().find(|s| s.window == w.id) {
-                    record.title = w.title.clone();
-                    record.class = w.class.clone();
-                }
                 continue;
             }
             // A dialog or popup (`WM_TRANSIENT_FOR`) belongs to its parent and
@@ -397,25 +444,22 @@ impl Daemon {
             // A window on another host desktop is not part of this desktop's
             // layout; adopt it when the user brings it here. Adopting it now
             // would put it in the tree and `apply` would move it back.
-            if self.seats.iter().all(|s| s.window != w.id)
-                && on_another_desktop(self.x.current_desktop(), self.x.desktop_of(w.id))
+            if on_another_desktop(self.x.current_desktop(), self.x.desktop_of(w.id))
             {
                 continue;
             }
-            if let Some(record) = self.seats.iter_mut().find(|s| s.window == w.id) {
-                record.title = w.title.clone();
-                record.class = w.class.clone();
-                continue;
-            }
             let seat = format!("s-{:x}", w.id);
-            let panel = format!("p-{:x}", w.id);
-            self.seats.push(SeatRecord {
+            let mut record = SeatRecord {
                 seat: seat.clone(),
-                panel: panel.clone(),
+                panel: format!("p-{:x}", w.id),
                 window: w.id,
                 class: w.class.clone(),
                 title: w.title.clone(),
-            });
+            };
+            // X11 can reuse a closed window's ID while its old tab group still owns the panel.
+            let panel = self.free_panel_id(&record);
+            record.panel = panel.clone();
+            self.seats.push(record);
             changed = true;
             // A new window joins the tag the user is looking at. Without this
             // it would belong to no tag and the active view would prune it
@@ -449,13 +493,36 @@ impl Daemon {
             } else {
                 self.push_floating(w, panel, seat);
             }
-        }
-        // Watch every managed window for the WM's synthetic ConfigureNotify:
-        // that is the only way to see a drag the daemon did not initiate.
-        for seat in &self.seats {
-            let _ = self.x.watch_window(seat.window);
+            self.watch_seat(win);
         }
         Ok(changed)
+    }
+
+    fn watch_seat(&mut self, win: u32) {
+        let subscribed = self.x.watch_window(win).is_ok();
+        // Read after selecting notifications: a change during adoption must
+        // either be reflected in this read or be queued on our connection.
+        if let Ok(Some(info)) = self.x.info(win) {
+            if let Some(seat) = self.seats.iter_mut().find(|s| s.window == win) {
+                seat.title = info.title;
+                seat.class = info.class;
+                if subscribed {
+                    self.watched.insert(win);
+                }
+            }
+        }
+    }
+
+    fn reconcile_layout(&mut self) -> Result<()> {
+        if self.reconcile()? {
+            if self.drag.is_some() {
+                let _ = self.end_gap_drag();
+            }
+            self.normalize_camera();
+            let _ = self.apply();
+            let _ = self.save();
+        }
+        Ok(())
     }
 
     fn push_floating(&mut self, w: &WindowInfo, panel: String, seat: String) {
@@ -741,7 +808,7 @@ impl Daemon {
                 let Some(seat) = self.seats.iter().find(|s| &s.seat == view) else {
                     continue;
                 };
-                let Ok(Some(info)) = self.x.info(seat.window) else {
+                let Ok(Some(state)) = self.x.window_state(seat.window) else {
                     continue;
                 };
                 // A fullscreen window owns its geometry: the WM has taken it
@@ -749,7 +816,7 @@ impl Daemon {
                 // window (dialog, popup) belongs to its parent, and tiling it
                 // lands it wherever the parent happens to be — awesome#22.
                 // Leave both alone until the state clears.
-                if info.fullscreen || info.transient {
+                if state.fullscreen || state.transient {
                     continue;
                 }
                 // On another host desktop the window belongs to the WM there;
@@ -760,13 +827,13 @@ impl Daemon {
                 // A maximized window ignores `_NET_MOVERESIZE_WINDOW`: the
                 // tile would keep the full-screen geometry and the tree would
                 // lie. Drop the state, then move.
-                if info.maximized {
+                if state.maximized {
                     let _ = self.x.unmaximize(seat.window);
                 }
                 // Snap the client area to its own resize grid, so a terminal
                 // lands flush against the tile instead of being clamped by the
                 // WM to an arbitrary shortfall.
-                let target = snap_to_hints(target, self.x.size_hints(seat.window), info.extents);
+                let target = snap_to_hints(target, self.x.size_hints(seat.window), self.x.frame_extents(seat.window));
                 let _ = self.x.move_resize(seat.window, target);
                 self.applied.insert(seat.window, target);
             }
@@ -1036,13 +1103,19 @@ impl Daemon {
         // Snapshot before the command so a dock, float, arrange or gap change
         // can be undone. `undo` is exempt: recording the state it replaces
         // would let undo oscillate between two layouts.
-        let before = self.snapshot();
+        let track = !matches!(
+            argv.first().map(String::as_str),
+            Some("undo" | "status" | "tree" | "list" | "rects" | "keys")
+        );
+        let before = track.then(|| self.snapshot());
         let result = self.dispatch(argv);
-        if result.is_ok()
-            && argv.first().map(String::as_str) != Some("undo")
-            && self.snapshot() != before
-        {
-            self.undo.push(before);
+        if let Some(before) = before {
+            let changed = self.file.doc != before.doc
+                || self.engine != before.engine
+                || self.camera != before.camera;
+            if result.is_ok() && changed {
+                self.undo.push(before);
+            }
         }
         if let Some(panel) = self.focused_panel() {
             if self.file.doc.root.node(&panel).is_some() {
@@ -2154,7 +2227,11 @@ impl Daemon {
     /// Register a status-bar client. The first record is the committed state,
     /// so a bar that connects after startup does not have to poll for what it
     /// missed (bspwm's startup-state gap).
-    fn subscribe_stream(&mut self, stream: &UnixStream) -> Result<()> {
+    fn subscribe_stream(
+        &mut self,
+        stream: &UnixStream,
+        before: &mut Option<EventSig>,
+    ) -> Result<()> {
         if self.subscribers.len() >= SUB_MAX_CLIENTS {
             anyhow::bail!("too many subscribers (limit {SUB_MAX_CLIENTS})");
         }
@@ -2169,20 +2246,25 @@ impl Daemon {
             partial: 0,
             drained: Instant::now(),
         });
-        let state = self.state_record();
+        let active = self.x.active_window().unwrap_or(0);
+        if before.is_none() {
+            // Later requests in this pass can mutate the state we are about to send.
+            *before = self.event_sig(Some(active));
+        }
+        let state = self.state_record(active);
         let last = self.subscribers.len() - 1;
         self.push_record(last, state);
         self.flush_subscribers();
         Ok(())
     }
 
-    fn state_record(&self) -> serde_json::Value {
+    fn state_record(&self, active: u32) -> serde_json::Value {
         serde_json::json!({
             "type": "state",
             "tree": serde_json::to_value(&self.file.doc.root).unwrap_or(serde_json::Value::Null),
             "gap": self.engine.gap,
             "overlay": self.overlay_on,
-            "active": self.x.active_window().unwrap_or(0),
+            "active": active,
             "tag": self.file.doc.active_tag,
             // The full tag list, so a bar can draw every workspace tab from the
             // one snapshot it already reads.
@@ -2258,7 +2340,7 @@ impl Daemon {
 
     /// The committed state, or `None` when nobody is listening — the diff is
     /// only worth computing for a client that will read it.
-    fn event_sig(&self) -> Option<EventSig> {
+    fn event_sig(&self, active: Option<u32>) -> Option<EventSig> {
         if self.subscribers.is_empty() {
             return None;
         }
@@ -2278,16 +2360,13 @@ impl Daemon {
         Some(EventSig {
             root: serde_json::to_string(&self.file.doc.root).ok()?,
             placements,
-            active: self.x.active_window().unwrap_or(0),
+            active: active.unwrap_or_else(|| self.x.active_window().unwrap_or(0)),
             tag: self.file.doc.active_tag.clone(),
         })
     }
 
-    fn emit_diff(&mut self, before: EventSig) {
-        let Some(after) = self.event_sig() else {
-            return;
-        };
-        for record in diff_events(&before, &after) {
+    fn emit_diff(&mut self, before: EventSig, after: &EventSig) {
+        for record in diff_events(&before, after) {
             self.publish(record);
         }
         self.flush_subscribers();
@@ -2317,6 +2396,8 @@ impl Daemon {
         let listener = UnixListener::bind(&socket)
             .with_context(|| format!("binding {}", socket.display()))?;
         let (tx, rx) = mpsc::channel::<(Request, UnixStream)>();
+        let (mut wake, mut signal) = UnixStream::pair()?;
+        signal.set_nonblocking(true)?;
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let Ok(clone) = stream.try_clone() else { continue };
@@ -2324,7 +2405,11 @@ impl Daemon {
                 let mut line = String::new();
                 if reader.read_line(&mut line).is_ok() {
                     if let Ok(request) = serde_json::from_str::<Request>(line.trim()) {
-                        let _ = tx.send((request, stream));
+                        if tx.send((request, stream)).is_err() {
+                            break;
+                        }
+                        // A full socket already carries a pending wakeup.
+                        let _ = signal.write_all(&[1]);
                     }
                 }
             }
@@ -2333,9 +2418,13 @@ impl Daemon {
         // A pager's `_NET_ACTIVE_WINDOW` request arrives only if we select
         // root's substructure events; failure is not fatal, a taskbar click
         // then simply does nothing.
-        if let Err(e) = self.x.watch_root() {
-            eprintln!("pergola: cannot watch activation requests: {e:#}");
-        }
+        let watches_root = match self.x.watch_root() {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("pergola: cannot watch activation requests: {e:#}");
+                false
+            }
+        };
         match self.reinstall_bindings() {
             Ok(notes) => {
                 for note in notes {
@@ -2353,32 +2442,37 @@ impl Daemon {
         );
 
         let mut last_reconcile = Instant::now();
+        let mut committed: Option<EventSig> = None;
+        let mut focus_deadline: Option<Instant> = None;
         while self.running {
             // One committed snapshot per loop pass: every mutation inside the
             // pass (reconcile, a request, a drag settling) is diffed against
             // the state the previous pass left, so a bar sees transitions, not
             // intermediate half-applied trees (i3#3893's phantom focus).
-            let before = self.event_sig();
+            let mut before = committed.take().or_else(|| self.event_sig(None));
+            let moving = !self.moves.is_empty() || !self.deferred.is_empty();
+            let mut timeout = Duration::from_secs(2).saturating_sub(last_reconcile.elapsed());
+            if moving || !watches_root || self.subscribers.iter().any(|c| !c.queue.is_empty()) {
+                timeout = timeout.min(Duration::from_millis(50));
+            }
+            if before.is_none() {
+                focus_deadline = None;
+            }
+            if let Some(deadline) = focus_deadline {
+                timeout = timeout.min(deadline.saturating_duration_since(Instant::now()));
+            }
+            let event = wait_for_input(&self.x, &mut wake, timeout);
             if last_reconcile.elapsed() >= Duration::from_secs(2) {
                 last_reconcile = Instant::now();
-                match self.reconcile() {
-                    Ok(true) => {
-                        if self.drag.is_some() {
-                            let _ = self.end_gap_drag();
-                        }
-                        self.normalize_camera();
-                        let _ = self.apply();
-                        let _ = self.save();
-                    }
-                    Ok(false) => {}
-                    Err(e) => eprintln!("pergola: reconcile: {e:#}"),
+                if let Err(e) = self.reconcile_layout() {
+                    eprintln!("pergola: reconcile: {e:#}");
                 }
             }
             while let Ok((request, mut stream)) = rx.try_recv() {
                 // `subscribe` turns the request/response socket into a stream:
                 // the daemon keeps this client and pushes records to it.
                 if request.argv.first().map(String::as_str) == Some("subscribe") {
-                    if let Err(e) = self.subscribe_stream(&stream) {
+                    if let Err(e) = self.subscribe_stream(&stream, &mut before) {
                         // A refused client must hear why: it is waiting on a
                         // read that would otherwise never return.
                         eprintln!("pergola: subscribe: {e:#}");
@@ -2397,7 +2491,7 @@ impl Daemon {
             // One blocking poll for the idle path, then drain whatever else the
             // server has queued (a window drag produces a burst of configures,
             // and the pointer drag stream must not fall behind).
-            match self.x.next_event(50) {
+            match event {
                 Ok(Some(event)) => {
                     if let Err(e) = self.on_x_event(event) {
                         eprintln!("pergola: event: {e:#}");
@@ -2422,7 +2516,27 @@ impl Daemon {
                 }
             }
             if let Some(before) = before {
-                self.emit_diff(before);
+                if let Some(mut after) = self.event_sig(None) {
+                    // Some WMs briefly clear _NET_ACTIVE_WINDOW between two
+                    // clients. Publish a genuine focus loss after one short
+                    // settling interval, without delaying other stream records.
+                    if before.active != 0 && after.active == 0 {
+                        let deadline = focus_deadline.get_or_insert_with(|| {
+                            Instant::now() + Duration::from_millis(50)
+                        });
+                        if Instant::now() < *deadline {
+                            after.active = before.active;
+                        } else {
+                            focus_deadline = None;
+                        }
+                    } else {
+                        focus_deadline = None;
+                    }
+                    self.emit_diff(before, &after);
+                    if !self.subscribers.is_empty() {
+                        committed = Some(after);
+                    }
+                }
             }
         }
 
@@ -2547,12 +2661,19 @@ impl Daemon {
             // without this the tree keeps the name the window had when it was
             // adopted until the next 2 s reconcile — herbstluftwm#35, bspwm#50.
             Event::PropertyNotify(property) => {
-                if self.x.is_title_atom(property.atom) {
+                if property.window == self.x.root
+                    && self.x.is_client_list_atom(property.atom)
+                    && property.state == x11rb::protocol::xproto::Property::NEW_VALUE
+                {
+                    self.reconcile_layout()?;
+                } else if self.x.is_title_atom(property.atom) {
                     if let Ok(Some(info)) = self.x.info(property.window) {
                         if let Some(seat) = self.seats.iter_mut().find(|s| s.window == property.window) {
                             seat.title = info.title;
                             seat.class = info.class;
                         }
+                    } else {
+                        self.watched.remove(&property.window);
                     }
                 }
             }
@@ -2563,15 +2684,9 @@ impl Daemon {
             // make the daemon mistake the new window for the dead one —
             // updating its title and never adopting it.
             Event::DestroyNotify(destroy) => {
+                self.watched.remove(&destroy.window);
                 if self.seats.iter().any(|s| s.window == destroy.window) {
-                    if self.reconcile()? {
-                        if self.drag.is_some() {
-                            let _ = self.end_gap_drag();
-                        }
-                        self.normalize_camera();
-                        let _ = self.apply();
-                        let _ = self.save();
-                    }
+                    self.reconcile_layout()?;
                 }
             }
             _ => {}

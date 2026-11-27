@@ -17,12 +17,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 thiserror = "2"
-clap = { version = "4", features = ["derive"] }
-x11rb = { version = "0.13", features = ["allow-unsafe-code", "shape"] }
+x11rb = { version = "0.13", features = ["shape"] }
 dirs = "5"
 libc = "0.2"
 
 [profile.release]
-opt-level = 2
-lto = "thin"
+opt-level = "s"
+lto = "fat"
 strip = true
+
+[profile.release.package.x11rb-protocol]
+opt-level = "s"

@@ -19,6 +19,14 @@ use x11rb::wrapper::ConnectionExt as _;
 
 use pergola_core::{Axis, IRect, Rect};
 
+/// Window-manager flags needed to decide whether and how a client can be tiled.
+pub struct WindowState {
+    pub hidden: bool,
+    pub transient: bool,
+    pub fullscreen: bool,
+    pub maximized: bool,
+}
+
 /// A managed top-level window, as Pergola sees it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowInfo {
@@ -256,30 +264,50 @@ impl X11 {
         value
     }
 
+    /// State of a viewable, managed window.
+    pub fn window_state(&self, win: u32) -> Result<Option<WindowState>> {
+        // Queue independent requests together. Reading each reply before
+        // issuing the next would cost one server round trip per property.
+        let attrs = self.conn.get_window_attributes(win)?;
+        let types = self.conn.get_property(
+            false, win, self.atoms.net_wm_window_type, AtomEnum::ATOM, 0, 64,
+        )?;
+        let states = self.conn.get_property(
+            false, win, self.atoms.net_wm_state, AtomEnum::ATOM, 0, 64,
+        )?;
+        let transient = self.conn.get_property(
+            false, win, AtomEnum::WM_TRANSIENT_FOR, AtomEnum::WINDOW, 0, 1,
+        );
+        let attrs = attrs.reply()?;
+        if attrs.override_redirect || attrs.map_state != x11rb::protocol::xproto::MapState::VIEWABLE {
+            return Ok(None);
+        }
+        let types = types.reply()?;
+        if types.value32().is_some_and(|mut atoms| atoms.any(|t| self.atoms.type_skip.contains(&t))) {
+            return Ok(None);
+        }
+        let states = states.reply()?;
+        let has_state = |atom| states.value32().is_some_and(|mut values| values.any(|v| v == atom));
+        let hidden = has_state(self.atoms.net_wm_state_hidden);
+        let fullscreen = has_state(self.atoms.net_wm_state_fullscreen);
+        let maximized = has_state(self.atoms.net_wm_state_maximized_horz)
+            || has_state(self.atoms.net_wm_state_maximized_vert);
+        let transient = transient.ok().and_then(|c| c.reply().ok())
+            .is_some_and(|r| r.value_len > 0);
+
+        Ok(Some(WindowState {
+            hidden,
+            transient,
+            fullscreen,
+            maximized,
+        }))
+    }
+
     /// Describe one window, or `None` when it is not a normal managed window.
     pub fn info(&self, win: u32) -> Result<Option<WindowInfo>> {
-        let attrs = self.conn.get_window_attributes(win)?.reply()?;
-        if attrs.override_redirect || attrs.map_state != x11rb::protocol::xproto::MapState::VIEWABLE
-        {
+        let Some(WindowState { hidden, transient, fullscreen, maximized }) = self.window_state(win)? else {
             return Ok(None);
-        }
-        let types = self.atom_list(win, self.atoms.net_wm_window_type)?;
-        if types.iter().any(|t| self.atoms.type_skip.contains(t)) {
-            return Ok(None);
-        }
-        let states = self.atom_list(win, self.atoms.net_wm_state)?;
-        let hidden = states.contains(&self.atoms.net_wm_state_hidden);
-        let fullscreen = states.contains(&self.atoms.net_wm_state_fullscreen);
-        let maximized = states.contains(&self.atoms.net_wm_state_maximized_horz)
-            || states.contains(&self.atoms.net_wm_state_maximized_vert);
-        let transient = self
-            .conn
-            .get_property(false, win, AtomEnum::WM_TRANSIENT_FOR, AtomEnum::WINDOW, 0, 1)
-            .ok()
-            .and_then(|c| c.reply().ok())
-            .map(|r| r.value_len > 0)
-            .unwrap_or(false);
-
+        };
         let geom = self.conn.get_geometry(win)?.reply()?;
         let translated = self
             .conn
@@ -850,10 +878,16 @@ impl X11 {
     pub fn watch_root(&self) -> Result<()> {
         self.conn.change_window_attributes(
             self.root,
-            &ChangeWindowAttributesAux::new().event_mask(EventMask::SUBSTRUCTURE_NOTIFY),
-        )?;
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::SUBSTRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE),
+        )?
+        .check()?;
         self.conn.flush()?;
         Ok(())
+    }
+
+    /// Root property that signals membership changes in the WM's client list.
+    pub fn is_client_list_atom(&self, atom: u32) -> bool {
+        atom == self.atoms.net_client_list
     }
 
     /// The `_NET_ACTIVE_WINDOW` atom, for matching an incoming request.
@@ -869,7 +903,8 @@ impl X11 {
             win,
             &ChangeWindowAttributesAux::new()
                 .event_mask(EventMask::STRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE),
-        )?;
+        )?
+        .check()?;
         Ok(())
     }
 
