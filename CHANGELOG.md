@@ -212,6 +212,13 @@ text and the "never write an invalid value" rule are unchanged.
 
 ### Changed
 
+* **A panel keeps a unique id when X11 reuses a closed window's id (PR #3,
+  Etothetaui).** The panel id is `p-<hex window id>`, and a tab group in the
+  document can outlive the window whose id it was named after: a new client
+  handed the recycled id used to adopt the old group's panel and its geometry.
+  `free_panel_id` now picks `p-<id>-N` for the new seat and leaves the group
+  alone.
+
 * **The layout document gains `doc.tags` and `doc.active_tag`.** Both are
   `#[serde(default)]`, so a document written before tags loads unchanged (no
   tag = every view shown) and an older binary reads a tagged document by
@@ -219,7 +226,17 @@ text and the "never write an invalid value" rule are unchanged.
   a document-format change and therefore a deliberate `MINOR` bump
   ([docs/VERSIONING.md](docs/VERSIONING.md)).
 
-### Fixed
+* **The daemon waits on X11 and the IPC listener together (PR #3, Etothetaui).**
+  The main loop used to block in `next_event(50)` and wake on the socket only
+  through the 2 s reconcile pass. It now `poll`s the X connection and a wake
+  socket, so an idle daemon sleeps until either side has work, a request is
+  served without waiting for the next pass, and the X server is woken once per
+  pass instead of on a fixed timer. Adoption, title refresh and the client-list
+  watch are driven by the WM's `_NET_CLIENT_LIST` change instead of a 2 s poll.
+  Measured in the contributor's pairs: settled RSS 2,620 -> 2,164 KiB, and this
+  PR's release binary 1,709,000 -> 1,219,736 bytes on the same toolchain
+  (`opt-level = "s"`, fat LTO, `strip`), with the e2e suite green on xfwm4 and
+  openbox (219/219 and 215-217/217, three runs each on the merged tree).
 
 * **`pergola-git`'s `pkgver()` was hard-coded to `0.4.0`** and did not follow
   the crate version, so the AUR package reported an older minor after a bump. It
