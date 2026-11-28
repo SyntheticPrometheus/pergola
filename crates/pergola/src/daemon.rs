@@ -127,9 +127,10 @@ struct GapDrag {
     extent: f64,
     /// Pointer position at ButtonPress, in root coordinates.
     start: (i32, i32),
-    /// Tree when the drag began. Every motion re-derives from this snapshot, so
-    /// a drag can never accumulate rounding drift.
-    snapshot: LayoutNode,
+    /// Captured on the first effective move. Its root anchors the whole gesture.
+    before: Option<Snapshot>,
+    /// Last pointer displacement along the split axis.
+    last_offset: i32,
 }
 
 /// What a pointer hint is showing. Enter/Leave arrive for every band window,
@@ -251,12 +252,16 @@ fn deferred_action(
 
 pub struct Daemon {
     x: X11,
+    tag_parking: pergola_x11::tag_parking::TagParking,
+    pending_tag_focus: Option<String>,
+    tag_carry: Option<String>,
     engine: LayoutEngine,
     file: LayoutFile,
     camera: pergola_core::CameraState,
     config: Config,
     overlay_on: bool,
     bindings: Vec<(KeyBinding, String)>,
+    held_keys: std::collections::BTreeSet<(u8, u16)>,
     keymap: Vec<(u8, u32)>,
     seats: Vec<SeatRecord>,
     /// Seated clients with a confirmed property/structure event subscription.
@@ -267,6 +272,7 @@ pub struct Daemon {
     /// Desktop-space rectangle from the previous apply, used to notice that the
     /// desktop leaf moved (and floating windows must be remapped).
     last_desk: Option<Rect>,
+    last_workarea: Option<IRect>,
     /// Force floating windows to their stored rect on the next apply.
     place_floating: bool,
     /// Whether the previous apply ran under a camera transform. Live rects seen
@@ -345,19 +351,29 @@ impl Daemon {
         let overlay_on = config.overlay;
         let bindings: Vec<(KeyBinding, String)> = Vec::new();
         let keymap = build_keymap(&x)?;
+        let tag_parking = pergola_x11::tag_parking::TagParking::new(
+            &x,
+            &layout_path,
+            seats.iter().map(|seat| seat.window),
+        )?;
         let mut daemon = Self {
             x,
+            tag_parking,
+            pending_tag_focus: None,
+            tag_carry: None,
             engine,
             file,
             camera,
             config,
             overlay_on,
             bindings,
+            held_keys: Default::default(),
             keymap,
             seats,
             watched: HashSet::new(),
             last_focus: None,
             last_desk: None,
+            last_workarea: None,
             place_floating: true,
             last_zoomed: false,
             running: true,
@@ -407,6 +423,10 @@ impl Daemon {
         let mut changed = !gone.is_empty();
         for seat in gone {
             self.watched.remove(&seat.window);
+            self.tag_parking.forget(seat.window);
+            if self.tag_carry.as_ref() == Some(&seat.seat) {
+                self.tag_carry = None;
+            }
             self.applied.remove(&seat.window);
             self.moves.remove(&seat.window);
             self.deferred.remove(&seat.window);
@@ -780,6 +800,18 @@ impl Daemon {
         }
         self.last_screen = Some(screen);
         let world = screen.to_rect();
+        if (self.tag_parking.native && self.file.doc.active_tag.is_some())
+            || self.tag_parking.has_owned()
+        {
+            for seat in &self.seats {
+                let hide = !self.file.doc.view_visible(&seat.seat);
+                if (hide || self.tag_parking.owns(seat.window))
+                    && !self.foreign_desktop(seat.window)
+                {
+                    let _ = self.tag_parking.sync(&self.x, seat.window, hide);
+                }
+            }
+        }
         // The camera must point at a node that exists in the tree being drawn.
         // A command may move the last window off a tag, leaving the camera
         // framed on the empty desktop leaf; `apply` is the one place every
@@ -854,7 +886,9 @@ impl Daemon {
         // Windows on a tag that is not shown leave the screen: park them below
         // the work area. They keep their seat and their place in the full tree,
         // so switching back restores the layout exactly.
-        self.park_inactive(&shown, screen)?;
+        if !self.tag_parking.native {
+            self.park_inactive(&shown, screen)?;
+        }
 
         // The desktop leaf is a space, not the whole screen: floating windows
         // are mapped into whatever rectangle it currently occupies. Their stored
@@ -893,6 +927,9 @@ impl Daemon {
                 .map(|v| self.file.doc.view_visible(v))
                 .unwrap_or(true)
             {
+                if self.tag_parking.native {
+                    continue;
+                }
                 let target = IRect::new(
                     screen.x,
                     screen.y + screen.h,
@@ -976,6 +1013,22 @@ impl Daemon {
             self.hide_hint()?;
             self.refresh_gap_bands()?;
         }
+        self.last_workarea = Some(screen);
+        let applied = &self.applied;
+        let visible = |win: &u32| {
+            applied
+                .get(win)
+                .is_none_or(|r| intersects_workarea(*r, screen))
+        };
+        // A new layout target supersedes movement observed against the old target.
+        self.moves.retain(|win, watch| {
+            visible(win)
+                && applied
+                    .get(win)
+                    .is_none_or(|r| same_rect(r.to_rect(), watch.start))
+        });
+        self.deferred.retain(|win, _| visible(win));
+        self.focus_returned_tag();
         self.last_apply = Instant::now();
         self.x.conn.flush()?;
         Ok(())
@@ -1348,7 +1401,23 @@ impl Daemon {
         // user think the tile vanished.
         for seat in &self.seats {
             if !windows.iter().any(|w| w.id == seat.window) {
-                out.push_str(&format!("{:<9} 0x{:08x}  {}\n", "hidden", seat.window, seat.title));
+                if self.tag_parking.owns(seat.window) && !self.file.doc.view_visible(&seat.seat) {
+                    let tag_note = self
+                        .file
+                        .doc
+                        .tag_of(&seat.seat)
+                        .map(|name| format!("  [tag {name}]"))
+                        .unwrap_or_default();
+                    out.push_str(&format!(
+                        "{:<9} 0x{:08x}  {:<20}  {}{tag_note}\n",
+                        "parked", seat.window, seat.class, seat.title
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "{:<9} 0x{:08x}  {}\n",
+                        "hidden", seat.window, seat.title
+                    ));
+                }
             }
         }
         Ok(out.trim_end().to_string())
@@ -1436,6 +1505,14 @@ impl Daemon {
             .seat_for_window(win)
             .ok_or_else(|| anyhow!("window 0x{win:x} is not managed by pergola"))?
             .clone();
+        let keep_in_front = self.x.active_window() == Some(win)
+            && !self.foreign_desktop(win)
+            && self.file.doc.view_visible(&seat.seat)
+            && !self.camera.desktop_hidden
+            && self
+                .x
+                .info(win)?
+                .is_some_and(|state| !state.hidden && !state.fullscreen && !state.transient);
         let rect = dropped
             // Already floating: keep the rectangle the user put it in. Falling
             // back to the default 80x80x800x500 here teleports the window to
@@ -1471,6 +1548,11 @@ impl Daemon {
         self.place_floating = true;
         self.normalize_camera();
         self.apply()?;
+        // Applying the surviving panel raises its selected tab, which may cover
+        // the freed client exactly. Keep a user-floated foreground client reachable.
+        if keep_in_front {
+            self.x.raise(win)?;
+        }
         self.save()?;
         Ok(format!("floated {panel_id}"))
     }
@@ -1687,6 +1769,36 @@ impl Daemon {
     /// Give the keyboard to a seat's window. Switching tabs without this leaves
     /// the user typing into the hidden view, which is the bug the whole feature
     /// exists to avoid.
+    /// Wait for the WM to finish each visible remap before asking it for focus.
+    /// Openbox can otherwise cancel the pending iconify and leave an owned
+    /// marker on a normal client during a rapid switch.
+    fn focus_returned_tag(&mut self) {
+        if self.pending_tag_focus.is_none()
+            || self.seats.iter().any(|s| {
+                self.tag_parking.owns(s.window)
+                    && self.file.doc.view_visible(&s.seat)
+                    && !self.foreign_desktop(s.window)
+            })
+        {
+            return;
+        }
+        let Some(name) = self.pending_tag_focus.take() else {
+            return;
+        };
+        if self.seats.iter().any(|s| {
+            s.seat == name
+                && !self.foreign_desktop(s.window)
+                && self
+                    .x
+                    .info(s.window)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|state| !state.hidden)
+        }) {
+            self.focus_seat(&name);
+        }
+    }
+
     fn focus_seat(&mut self, seat: &str) {
         if let Some(window) = self
             .seats
@@ -1923,10 +2035,18 @@ impl Daemon {
         // Remember the keyboard position on the tag being left, so the return
         // trip lands on the window the user was working in, not on whichever
         // window the desktop happens to focus last.
-        let focused = self
-            .x
-            .active_window()
-            .and_then(|w| self.seat_for_window(w).map(|s| s.seat.clone()));
+        let focused = self.pending_tag_focus.take().or_else(|| {
+            self.x
+                .active_window()
+                .and_then(|w| self.seat_for_window(w))
+                .filter(|s| self.file.doc.view_visible(&s.seat))
+                .map(|s| s.seat.clone())
+        });
+        // Openbox withdraws keyboard focus when it parks all windows. Remember
+        // the exact view being left for the move-with-Shift shortcut on an empty tag.
+        if self.file.doc.active_tag.as_deref() != Some(name) {
+            self.tag_carry = focused.clone();
+        }
         if let Some(current) = self.file.doc.active_tag.clone() {
             if let Some(tag) = self.file.doc.tag_mut(&current) {
                 tag.focus = focused;
@@ -1955,13 +2075,10 @@ impl Daemon {
                 .and_then(|t| t.focus.clone())
                 .filter(|seat| self.file.doc.view_visible(seat))
         };
-        if let Some(seat) = restore {
-            if self.seats.iter().any(|s| s.seat == seat) {
-                self.focus_seat(&seat);
-            }
-        }
+        self.pending_tag_focus = restore;
+        self.focus_returned_tag();
         self.save()?;
-        let message = match self.file.doc.active_tag.clone() {
+        let (message, help) = match self.file.doc.active_tag.clone() {
             Some(name) => {
                 let views = self
                     .file
@@ -1972,22 +2089,23 @@ impl Daemon {
                 if views == 0 {
                     // A new tag is empty on purpose, but an empty screen with no
                     // explanation reads as a crash. Name the way back.
-                    format!("tag {name} is empty — `pergola window-tag {name}` adds a window, `tag-view all` shows everything")
+                    (format!("tag {name} is empty — `pergola window-tag {name}` adds a window, `tag-view all` shows everything"),
+                     Some(format!("Workspace {name} is empty. Open Pergola’s action menu and choose ‘Show windows from all workspaces’.")))
                 } else {
-                    format!(
+                    (format!(
                         "tag {name} ({} view{})",
                         views,
                         if views == 1 { "" } else { "s" }
-                    )
+                    ), None)
                 }
             }
-            None => "tag off — every view is shown".to_string(),
+            None => ("tag off — every view is shown".to_string(), None),
         };
         // Switching workspaces changes the whole screen at once, and the screen
         // itself says nothing about where you are. The desktop's own notifier
         // names the workspace: a switch is a deliberate keypress, so this is the
         // one moment the words are worth the pixels.
-        crate::notify::send(&message);
+        crate::notify::workspace(&message, help.as_deref());
         Ok(message)
     }
 
@@ -2003,15 +2121,36 @@ impl Daemon {
         if name == "all" || name == "off" || name == "*" {
             return Err(anyhow!("'{name}' is not a tag name"));
         }
-        let win = flag(args, "--window")
-            .and_then(|v| parse_window(&v))
-            .or_else(|| self.x.active_window())
+        let explicit = flag(args, "--window").and_then(|v| parse_window(&v));
+        let win = explicit
+            .or_else(|| self.x.active_window().filter(|w| *w != 0))
+            .or_else(|| {
+                let tag = self.file.doc.active_tag.as_deref()?;
+                if tag != name || !self.file.doc.tag(tag)?.views.is_empty() {
+                    return None;
+                }
+                let previous = self.tag_carry.as_ref()?;
+                self.seats
+                    .iter()
+                    .find(|seat| {
+                        &seat.seat == previous
+                            && self.tag_parking.owns(seat.window)
+                            && !self.foreign_desktop(seat.window)
+                    })
+                    .map(|seat| seat.window)
+            })
             .ok_or_else(|| anyhow!("no active window to tag"))?;
         let seat = self
             .seat_for_window(win)
             .ok_or_else(|| anyhow!("window 0x{win:x} is not managed by pergola"))?
             .clone();
         self.file.doc.assign_view(&seat.seat, name);
+        if explicit.is_none()
+            && self.tag_parking.owns(win)
+            && self.file.doc.view_visible(&seat.seat)
+        {
+            self.pending_tag_focus = Some(seat.seat.clone());
+        }
         // The window may be leaving the screen (it went to another tag) or
         // coming back to it: let `apply` park or place it either way.
         self.place_floating = true;
@@ -2540,6 +2679,22 @@ impl Daemon {
             }
         }
 
+        // Return only local clients that this layout iconified. Their X properties
+        // retain recovery ownership if the WM is unavailable during shutdown.
+        let end = Instant::now() + Duration::from_millis(200);
+        while self.tag_parking.has_owned() && Instant::now() < end {
+            let mut local = false;
+            for seat in &self.seats {
+                if self.tag_parking.owns(seat.window) && !self.foreign_desktop(seat.window) {
+                    let _ = self.tag_parking.sync(&self.x, seat.window, false);
+                    local = true;
+                }
+            }
+            if !local || !self.tag_parking.has_owned() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
         let _ = self.x.overlay_hide();
         let _ = self.save();
         let _ = std::fs::remove_file(&socket);
@@ -2661,7 +2816,24 @@ impl Daemon {
             // without this the tree keeps the name the window had when it was
             // adopted until the next 2 s reconcile — herbstluftwm#35, bspwm#50.
             Event::PropertyNotify(property) => {
-                if property.window == self.x.root
+                if self.tag_parking.observes(property.window, property.atom)
+                    && !self.foreign_desktop(property.window)
+                {
+                    if let Some(seat) = self.seat_for_window(property.window) {
+                        let hide = !self.file.doc.view_visible(&seat.seat);
+                        if self.tag_parking.sync(&self.x, property.window, hide)? {
+                            self.place_floating = true;
+                            self.apply()?;
+                        }
+                    }
+                } else if self.tag_parking.native
+                    && property.window == self.x.root
+                    && self.tag_parking.host_switch(property.atom)
+                    && (self.file.doc.active_tag.is_some() || self.tag_parking.has_owned())
+                {
+                    self.place_floating = true;
+                    self.apply()?;
+                } else if property.window == self.x.root
                     && self.x.is_client_list_atom(property.atom)
                     && property.state == x11rb::protocol::xproto::Property::NEW_VALUE
                 {
@@ -2694,9 +2866,7 @@ impl Daemon {
         Ok(())
     }
 
-    /// Rebuild the keycode table and re-grab every binding after a keyboard
-    /// map change. Ungrabbing first drops chords that still point at the old
-    /// map; regrabbing the same client is idempotent.
+    /// Rebuild the keycode table while retaining unchanged passive grabs.
     /// Re-grab every binding and return the notes worth telling the user:
     /// commands with no free key, and commands that fell back to a secondary
     /// chord because the desktop owns the primary one. `reload` returns these
@@ -2706,15 +2876,15 @@ impl Daemon {
         if !self.config.hotkeys {
             // Hotkeys were switched off by a reload: drop the grabs so the
             // desktop gets its chords back instead of the daemon holding them.
-            let _ = self.x.ungrab_all_keys();
+            self.x.ungrab_all_keys()?;
+            self.held_keys.clear();
             self.bindings.clear();
             return Ok(vec!["hotkeys are off: no chords are grabbed".to_string()]);
         }
         self.keymap = build_keymap(&self.x)?;
-        let _ = self.x.ungrab_all_keys();
         let plan = self.config.binding_plan();
         let mut notes = Vec::new();
-        match self.x.install_bindings(&plan) {
+        match self.x.refresh_bindings(&plan, &mut self.held_keys) {
             Ok((bound, failures)) => {
                 self.bindings = bound;
                 for failure in &failures {
@@ -2913,8 +3083,7 @@ impl Daemon {
         Some(transform(rect, framed, world))
     }
 
-    /// Start dragging a split boundary. The tree is snapshotted so that every
-    /// motion is absolute, not incremental.
+    /// Start tracking a split boundary at its original pointer position.
     fn begin_gap_drag(&mut self, window: u32, x: i32, y: i32) -> Result<()> {
         let (first, second, axis, extent) = match self.band_for_window(window) {
             Some(handle) => (
@@ -2939,16 +3108,14 @@ impl Daemon {
                 "pergola: gap drag {first}|{second} axis {axis:?} extent {extent:.0}px"
             );
         }
-        // A gap drag is a layout change like any other: remember the tree the
-        // user started from so `undo` puts the split back.
-        self.undo.push(self.snapshot());
         self.drag = Some(GapDrag {
             first,
             second,
             axis,
             extent,
             start: (x, y),
-            snapshot: self.file.doc.root.clone(),
+            before: None,
+            last_offset: 0,
         });
         Ok(())
     }
@@ -2956,43 +3123,82 @@ impl Daemon {
     /// Move the dragged boundary: the pointer delta becomes a weight delta
     /// against the split's displayed length.
     fn update_gap_drag(&mut self, x: i32, y: i32) -> Result<()> {
-        let Some(drag) = &self.drag else {
+        let Some(drag) = &mut self.drag else {
             return Ok(());
         };
-        let delta_px = match drag.axis {
-            Axis::X => (x - drag.start.0) as f64,
-            Axis::Y => (y - drag.start.1) as f64,
+        let offset = match drag.axis {
+            Axis::X => x - drag.start.0,
+            Axis::Y => y - drag.start.1,
         };
-        let delta = delta_px / drag.extent;
-        let snapshot = drag.snapshot.clone();
-        let (first, second) = (drag.first.clone(), drag.second.clone());
-        match self.engine.resizing_gap(&first, &second, delta, &snapshot) {
-            Ok(tree) => {
-                self.replace_root(tree);
-                self.normalize_camera();
-                self.apply()?;
-            }
-            Err(e) => {
-                // Clamped at the minimum share: the layout is already as far as
-                // it may go, so this is not an error the user needs to see.
-                if std::env::var_os("PERGOLA_DEBUG").is_some() {
-                    eprintln!("pergola: gap drag: {e}");
+        if offset == drag.last_offset {
+            return Ok(());
+        }
+        drag.last_offset = offset;
+        let delta_px = f64::from(offset);
+        if delta_px == 0.0 && drag.before.is_none() {
+            return Ok(());
+        }
+        let origin = drag
+            .before
+            .as_ref()
+            .map_or(&self.file.doc.root, |s| &s.doc.root);
+        let tree = if delta_px == 0.0 {
+            // Return the exact starting weights, including any rounding in the file.
+            origin.clone()
+        } else {
+            match self.engine.resizing_gap(
+                &drag.first,
+                &drag.second,
+                delta_px / drag.extent,
+                origin,
+            ) {
+                Ok(tree) => tree,
+                Err(error) => {
+                    if std::env::var_os("PERGOLA_DEBUG").is_some() {
+                        eprintln!("pergola: gap drag: {error}");
+                    }
+                    return Ok(());
                 }
             }
+        };
+        let at_origin = tree == *origin;
+        if drag.before.is_none() {
+            if at_origin {
+                return Ok(());
+            }
+            let before = self.snapshot();
+            self.drag.as_mut().unwrap().before = Some(before);
         }
-        Ok(())
+        self.replace_root(tree);
+        self.normalize_camera();
+        if at_origin {
+            let drag = self.drag.as_mut().unwrap();
+            if drag
+                .before
+                .as_ref()
+                .is_some_and(|s| s.camera == self.camera)
+            {
+                drag.before = None;
+            }
+        }
+        self.apply()
     }
 
     fn end_gap_drag(&mut self) -> Result<()> {
-        if self.drag.take().is_none() {
+        let Some(drag) = self.drag.take() else {
             return Ok(());
-        }
-        // Rebuild the bands before saving: a failed write must not leave the
-        // pointer without grab areas until the next apply.
+        };
+        // An apply during the gesture deferred rebuilding the grab areas. Try
+        // both operations even if one fails, so a failed save cannot strand them.
         let bands = self.refresh_gap_bands();
-        let saved = self.save();
-        bands?;
-        saved
+        if let Some(before) = drag.before {
+            self.undo.push(before);
+            let saved = self.save();
+            bands?;
+            saved
+        } else {
+            bands
+        }
     }
 
     /// Track a configure event that may be the user dragging a window. Our own
@@ -3000,6 +3206,15 @@ impl Daemon {
     /// apply); a drag is a burst of changes followed by silence.
     fn note_configure(&mut self, event: &ConfigureNotifyEvent) -> Result<()> {
         if event.override_redirect || self.drag.is_some() {
+            return Ok(());
+        }
+        // Openbox keeps part of an offscreen client visible. A configure from
+        // that clamp belongs to our park request, even after the apply guard.
+        if self
+            .last_workarea
+            .zip(self.applied.get(&event.window))
+            .is_some_and(|(screen, target)| !intersects_workarea(*target, screen))
+        {
             return Ok(());
         }
         // Our own apply echoes back as configure events; a window after it is
@@ -3026,11 +3241,11 @@ impl Daemon {
         // user wants docked; and a transient window's place belongs to its
         // parent. Treating either as a drag docks the wrong window to the
         // nearest edge — awesome#22, i3#594.
-        if let Ok(Some(info)) = self.x.info(event.window) {
-            if info.fullscreen || info.transient {
-                return Ok(());
-            }
-        }
+        let live = match self.x.info(event.window) {
+            Ok(Some(info)) if info.fullscreen || info.transient => return Ok(()),
+            Ok(Some(info)) => Some(frame_rect(&info)),
+            _ => None,
+        };
         // The WM reports client coordinates; edge snapping is about the frame
         // the user sees, so add the decorations back.
         let (l, r, t, b) = self.x.frame_extents(event.window);
@@ -3059,7 +3274,12 @@ impl Daemon {
             );
             return Ok(());
         }
-        self.track_configure(event.window, rect)
+        // A queued WM configure can describe a position the client has already
+        // left. Start tracking from its live frame. Once a drag is observed,
+        // keep its event trajectory, including a return to its starting edge.
+        let dragging = self.moves.get(&event.window).is_some_and(is_drag);
+        let observed = if dragging { rect } else { live.unwrap_or(rect) };
+        self.track_configure(event.window, observed)
     }
 
     /// Record a configure rect for a seat after the apply guard has passed.
@@ -3796,15 +4016,18 @@ fn park_if_outside(target: IRect, viewport: IRect, zoomed: bool) -> IRect {
     if !zoomed {
         return target;
     }
-    let visible = target.x < viewport.x + viewport.w
-        && target.x + target.w > viewport.x
-        && target.y < viewport.y + viewport.h
-        && target.y + target.h > viewport.y;
-    if visible {
+    if intersects_workarea(target, viewport) {
         target
     } else {
         IRect::new(viewport.x, viewport.y + viewport.h, target.w, target.h)
     }
+}
+
+fn intersects_workarea(target: IRect, viewport: IRect) -> bool {
+    target.x < viewport.x + viewport.w
+        && target.x + target.w > viewport.x
+        && target.y < viewport.y + viewport.h
+        && target.y + target.h > viewport.y
 }
 
 /// Is `window` on a host desktop other than the one the WM is showing?

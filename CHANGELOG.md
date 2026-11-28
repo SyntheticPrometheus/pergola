@@ -46,6 +46,26 @@ All notable changes to Pergola. Format follows the versioning rules in
 
 ### Fixed
 
+* **A divider released where it started no longer costs an Undo.** The drag took
+  its snapshot on press, so a press on a divider pushed an entry for a layout that
+  never changed and replaced the one the person wanted back. The snapshot is now
+  taken on the first move the split can act on, pointer travel that cannot resize
+  either pane is ignored instead of clamped, and the entry is pushed only at
+  release — a stationary press writes nothing and leaves the previous Undo alone.
+  Paired Alpine runs: eight real resizes still saved eight times, twenty-four
+  stationary clicks went from 24 layout writes to zero, median main-thread CPU for
+  eight drags 196.02 → 130.30 ms (Etothetaui, PR #4).
+
+* **Windows parked by Pergola come back on Openbox, and an empty workspace has a
+  way out.** The native tag path restores parked clients without un-minimising a
+  window the person minimised or taking one from the host WM's other desktops, and
+  a floated tab is raised when it is carried into an empty tag. An empty tag now
+  offers the palette row that shows windows from all workspaces instead of a blank
+  screen, routine workspace toasts are brief, and a custom `PERGOLA_NOTIFY` still
+  gets the message it was given. A keyboard-map refresh keeps the grabs it already
+  holds, and a configure event is compared with live geometry before it is read as
+  a drag out of the tile.
+
 * **`scripts/health.sh --e2e` builds the tree under test instead of failing on a
   stale binary.** The provenance check added on 2026-11-17 refuses to judge a
   tree the binary on disk was not built from, which is right — but the refusal

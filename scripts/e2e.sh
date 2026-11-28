@@ -138,12 +138,34 @@ else
 fi
 P status >/dev/null 2>&1 || fail "the second daemon stole the live socket"
 
-mapfile -t XWINS < <(xdotool search --class XTerm 2>/dev/null)
-[ "${#XWINS[@]}" -ge 3 ] || fail "test windows did not appear"
-W1="$(printf '0x%08x' "${XWINS[0]}")"
-W2="$(printf '0x%08x' "${XWINS[1]}")"
-W3="$(printf '0x%08x' "${XWINS[2]}")"
-[ "$W1" != "$W2" ] && [ "$W2" != "$W3" ] || fail "test windows are not distinct"
+# An XTerm XID exists before the WM maps it or Pergola adopts it. Wait for
+# each exact fixture title and XID in both live lists before testing Dock.
+deadline=$((SECONDS + 10))
+while :; do
+  wm_clients=$(timeout 1 wmctrl -l 2>&1)
+  pergola_clients=$(timeout 1 "$BIN" --socket "$SOCK" list 2>&1)
+  mapfile -t XWINS < <(awk '
+    $1 ~ /^0x/ { wm[$NF] = tolower($1) }
+    $1 == "floating" || $1 == "docked" || $1 == "tab" { seat[$NF] = tolower($2) }
+    END {
+      for (i = 1; i <= 3; i++) {
+        title = "pergola-e2e-" i
+        if (title in wm && wm[title] == seat[title]) print wm[title]
+      }
+    }' <<< "$wm_clients
+$pergola_clients")
+  [ "${#XWINS[@]}" -eq 3 ] && break
+  if [ "$SECONDS" -ge "$deadline" ]; then
+    say "expected pergola-e2e-1, pergola-e2e-2 and pergola-e2e-3"
+    say "window manager clients: $wm_clients"
+    say "Pergola clients: $pergola_clients"
+    fail "the three named clients were not adopted"
+  fi
+  sleep 0.1
+done
+W1="${XWINS[0]}"
+W2="${XWINS[1]}"
+W3="${XWINS[2]}"
 say "windows: $W1 $W2 $W3"
 
 # frame geometry as the X server sees it: client position/size + frame extents
@@ -269,6 +291,11 @@ active_is() { # active_is WINDOW_ID
 # off-screen" is the honest assertion that is true on both, and a window left in
 # place (100%) still fails it.
 onscreen_pct() {
+  # An iconified client keeps its former rectangle while its frame is invisible.
+  if xwininfo -id "$1" 2>/dev/null | grep -Eiq 'Map State: Is(Unmapped|Unviewable)'; then
+    echo 0
+    return
+  fi
   local X= Y= WIDTH= HEIGHT= WINDOW= SCREEN= top bottom vis
   eval "$(xdotool getwindowgeometry --shell "$1")"
   [ -n "${Y:-}" ] && [ -n "${HEIGHT:-}" ] || { echo 100; return; }

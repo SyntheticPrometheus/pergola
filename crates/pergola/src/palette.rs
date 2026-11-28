@@ -98,6 +98,12 @@ fn row(label: &str, argv: &[&str]) -> Item {
 /// a desktop that never started a workspace sees no workspace menu.
 fn workspace_rows(state: &State) -> Vec<Item> {
     let mut rows = Vec::new();
+    if state.active_tag.is_some() {
+        rows.push(row(
+            "Show windows from all workspaces",
+            &["tag-view", "all"],
+        ));
+    }
     for tag in &state.tags {
         if state.active_tag.as_deref() == Some(tag.as_str()) {
             continue;
@@ -135,9 +141,8 @@ pub fn state(socket: &Path) -> State {
     if !status.ok {
         return State::default();
     }
-    let Some((window, panel)) = parse_active(&status.message) else {
-        return State::default();
-    };
+    // X11 window 0 is None. An empty workspace still needs its navigation rows.
+    let (window, panel) = parse_active(&status.message).unwrap_or((0, None));
     let Ok(tree) = crate::ipc::call(socket, &["tree".to_string()]) else {
         return State::default();
     };

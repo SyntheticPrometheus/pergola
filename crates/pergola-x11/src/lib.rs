@@ -6,6 +6,10 @@
 //! asks the running WM to move windows with `_NET_MOVERESIZE_WINDOW`, exactly
 //! the way `wmctrl` does.
 
+pub mod tag_parking;
+
+use std::collections::BTreeSet;
+
 use anyhow::{anyhow, Context, Result};
 use x11rb::connection::{Connection, RequestConnection as _};
 use x11rb::protocol::xproto::{
@@ -919,39 +923,29 @@ impl X11 {
 
     // MARK: hotkeys
 
-    /// Grab one chord with every combination of the lock modifiers added, so a
-    /// key press still reaches us with Caps Lock or Num Lock on. Returns true
-    /// when the unmodified grab succeeded; the lock variants are best effort
-    /// because the desktop may legitimately own some of them.
-    fn grab_with_locks(&self, mods: u16, keycode: u8) -> bool {
-        let locks = lock_mod_masks(&self.conn);
-        let mut combinations = vec![0u16];
-        for mask in &locks {
-            let mut next = combinations.clone();
-            for extra in &combinations {
-                next.push(extra | mask);
-            }
-            combinations = next;
-        }
-        let mut base_ok = false;
-        for extra in combinations {
-            let ok = self
-                .conn
-                .grab_key(
-                    false,
-                    self.root,
-                    ModMask::from(mods | extra),
-                    keycode,
-                    GrabMode::ASYNC,
-                    GrabMode::ASYNC,
-                )
-                .map(|cookie| cookie.check().is_ok())
-                .unwrap_or(false);
-            if extra == 0 {
-                base_ok = ok;
+    fn lock_combinations(&self) -> Vec<u16> {
+        let mut combinations = vec![0];
+        for mask in lock_mod_masks(&self.conn) {
+            let len = combinations.len();
+            for i in 0..len {
+                combinations.push(combinations[i] | mask);
             }
         }
-        base_ok
+        combinations
+    }
+
+    fn grab_chord(&self, keycode: u8, mask: u16) -> bool {
+        self.conn
+            .grab_key(
+                false,
+                self.root,
+                ModMask::from(mask),
+                keycode,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+            )
+            .map(|cookie| cookie.check().is_ok())
+            .unwrap_or(false)
     }
 
     /// Release every root-window key grab this client owns, so a keyboard-map
@@ -986,7 +980,14 @@ impl X11 {
             };
             // BadAccess arrives asynchronously, so check the reply rather than
             // just the send.
-            if !self.grab_with_locks(binding.mods, keycode) {
+            let mut base_ok = false;
+            for lock in self.lock_combinations() {
+                let ok = self.grab_chord(keycode, binding.mods | lock);
+                if lock == 0 {
+                    base_ok = ok;
+                }
+            }
+            if !base_ok {
                 failed.push(binding.label.clone());
             }
         }
@@ -1307,6 +1308,15 @@ impl X11 {
         &self,
         plan: &[(String, Vec<String>)],
     ) -> Result<(Vec<(KeyBinding, String)>, Vec<BindFailure>)> {
+        self.refresh_bindings(plan, &mut BTreeSet::new())
+    }
+
+    /// Keep unchanged passive grabs live while reconciling the server keymap.
+    pub fn refresh_bindings(
+        &self,
+        plan: &[(String, Vec<String>)],
+        held: &mut BTreeSet<(u8, u16)>,
+    ) -> Result<(Vec<(KeyBinding, String)>, Vec<BindFailure>)> {
         let min = self.conn.setup().min_keycode;
         let max = self.conn.setup().max_keycode;
         let mapping = self
@@ -1321,6 +1331,8 @@ impl X11 {
                 .position(|chunk| chunk.contains(&sym))
                 .map(|i| min + i as u8)
         };
+        let locks = self.lock_combinations();
+        let mut desired = BTreeSet::new();
         let mut installed = Vec::new();
         let mut failures = Vec::new();
         for (command, specs) in plan {
@@ -1336,11 +1348,23 @@ impl X11 {
                 let Some(keycode) = keycode_for(binding.keysym) else {
                     continue;
                 };
-                if self.grab_with_locks(binding.mods, keycode) {
-                    installed.push((binding, command.clone()));
-                    bound = true;
-                    break;
+                let base = (keycode, binding.mods);
+                if !held.contains(&base) && !self.grab_chord(keycode, binding.mods) {
+                    continue;
                 }
+                desired.insert(base);
+                for lock in &locks {
+                    let chord = (keycode, binding.mods | lock);
+                    if desired.contains(&chord)
+                        || held.contains(&chord)
+                        || self.grab_chord(chord.0, chord.1)
+                    {
+                        desired.insert(chord);
+                    }
+                }
+                installed.push((binding, command.clone()));
+                bound = true;
+                break;
             }
             if !bound {
                 failures.push(BindFailure {
@@ -1349,6 +1373,11 @@ impl X11 {
                 });
             }
         }
+        for &(keycode, mask) in held.difference(&desired) {
+            self.conn
+                .ungrab_key(keycode, self.root, ModMask::from(mask))?;
+        }
+        *held = desired;
         self.conn.flush()?;
         Ok((installed, failures))
     }
